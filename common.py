@@ -105,6 +105,8 @@ def compare_loss(model_cls, config, dtype, rtol=1e-2, atol=1e-2):
     device = torch.device(get_accelerator().current_device_name())
     model = model_cls(hidden_dim)
 
+    deepspeed.init_distributed(dist_backend='nccl')
+
     i = get_accelerator().current_device()
     baseline_model = DDP(deepcopy(model).to(device=device, dtype=torch.float), device_ids=[i], output_device=i)
     baseline_optimizer = torch.optim.Adam(baseline_model.parameters(), lr=config["optimizer"]["params"]["lr"])
@@ -142,4 +144,3 @@ def compare_loss(model_cls, config, dtype, rtol=1e-2, atol=1e-2):
         with GatheredParameters(target_engine.parameters()):
             for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
                 assert torch.allclose(p1.to(dtype), p2, rtol=rtol, atol=atol)
-

@@ -9,6 +9,7 @@ import torch
 import argparse
 
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+from deepspeed.accelerator import get_accelerator
 
 from common import bf16_required_version_check, compare_loss
 
@@ -17,7 +18,7 @@ def get_args():
     parser = argparse.ArgumentParser(description='DeepSpeed ZeRO unit test.')
     parser.add_argument('--local_rank', type=int, default=-1, help='local rank')
     parser.add_argument('--dtype', choices=['torch.bfloat16', 'torch.float16', 'torch.float32'], default='torch.float32', help='data type')
-    parser.add_argument('--zero_stage', type=int, choices=[1, 2, 3], default=1, help='ZeRO stage')
+    parser.add_argument('--zero_stage', type=int, choices=[0, 1, 2, 3], default=1, help='ZeRO stage')
     parser.add_argument('--offload_device', choices=['none', 'cpu', 'nvme'], default='none', help='offload device')
     
     return parser.parse_args()
@@ -40,11 +41,11 @@ class SimpleModel(torch.nn.Module):
     
 
 def main(args):
-    args = get_args()
     dtype = eval(args.dtype)
     zero_stage = args.zero_stage
     offload_device = eval(f"OffloadDeviceEnum.{args.offload_device}")
     
+    get_accelerator().set_device(args.local_rank)
 
     if dtype == torch.bfloat16 and not bf16_required_version_check():
         pytest.skip(
@@ -87,3 +88,8 @@ def main(args):
         config_dict["bf16"] = {"enabled": True}
 
     compare_loss(SimpleModel, config_dict, dtype, rtol=0.0, atol=0.0)
+
+
+if __name__ == '__main__':
+    args = get_args()
+    main(args)

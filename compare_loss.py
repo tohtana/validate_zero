@@ -20,6 +20,9 @@ def get_args():
     parser.add_argument('--dtype', choices=['torch.bfloat16', 'torch.float16', 'torch.float32'], default='torch.float32', help='data type')
     parser.add_argument('--zero_stage', type=int, choices=[0, 1, 2, 3], default=1, help='ZeRO stage')
     parser.add_argument('--offload_device', choices=['none', 'cpu', 'nvme'], default='none', help='offload device')
+    parser.add_argument('--use_torch_adam', action='store_true', help='use torch adam optimizer')
+    parser.add_argument('--rtol', type=float, default=0., help='relative tolerance')
+    parser.add_argument('--atol', type=float, default=0., help='absolute tolerance')
     
     return parser.parse_args()
 
@@ -62,16 +65,12 @@ def main(args):
         "optimizer": {
             "type": "Adam",
             "params": {
-                "lr": 0.00015
-            }
+                "lr": 0.015
+            },
         },
         "zero_optimization": {
             "stage": zero_stage,
         },
-        "compile": {
-            "enabled": True,
-            "backend": "inductor"
-        }
     }
 
     if offload_device == OffloadDeviceEnum.cpu:
@@ -87,7 +86,7 @@ def main(args):
     elif dtype == torch.bfloat16:
         config_dict["bf16"] = {"enabled": True}
 
-    compare_loss(SimpleModel, config_dict, dtype, rtol=0.0, atol=0.0)
+    compare_loss(args, SimpleModel, rtol=args.rtol, atol=args.atol)
 
 
 if __name__ == '__main__':

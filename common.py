@@ -11,6 +11,7 @@ from copy import deepcopy
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import autocast, GradScaler
 
 import deepspeed
 from deepspeed.accelerator import get_accelerator
@@ -93,7 +94,66 @@ def bf16_required_version_check(accelerator_check=True):
         return True
     else:
         return False
-    
+
+
+def train_amp(baseline_model,
+                baseline_optimizer,
+                target_engine,
+                dtype,
+                scaler,
+                x, y,
+                rtol, atol):
+    # Runs the forward pass with autocasting.
+    with torch.autocast(device_type="cuda", dtype=dtype):
+        baseline_optimizer.zero_grad()
+        baseline_loss = baseline_model(x, y)
+        scaler.scale(baseline_loss).backward()
+        scaler.step(baseline_optimizer)
+        scaler.update()
+
+    target_loss = target_engine(x.to(dtype), y.to(dtype))
+    assert torch.allclose(baseline_loss.half(), target_loss, rtol=rtol, atol=atol)
+
+    target_engine.backward(target_loss)
+    target_engine.step()
+
+    with GatheredParameters(target_engine.parameters()):
+        for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
+            assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
+
+
+def train_no_amp(baseline_model,
+                 baseline_optimizer,
+                 target_engine,
+                 x, y,
+                 rtol, atol):
+
+    baseline_loss = baseline_model(x, y)
+    target_loss = target_engine(x, y)
+
+    assert torch.allclose(baseline_loss, target_loss, rtol=rtol, atol=atol)
+
+    with GatheredParameters(target_engine.parameters()):
+        for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
+            assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
+
+    baseline_loss.backward()
+    target_engine.backward(target_loss)
+
+    for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
+        g2 = deepspeed.utils.safe_get_full_grad(p2)
+        assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
+        assert torch.allclose(p1.grad, g2, rtol=rtol, atol=atol)
+
+    baseline_optimizer.step()
+    target_engine.step()
+
+    baseline_model.zero_grad()
+
+    with GatheredParameters(target_engine.parameters()):
+        for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
+            assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
+
 
 @enable_determinism(123)
 def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
@@ -148,10 +208,14 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
 
     i = get_accelerator().current_device()
     lr = config_dict["optimizer"]["params"]["lr"]
-    baseline_model = DDP(deepcopy(model).to(device=device, dtype=dtype), device_ids=[i], output_device=i)
+    baseline_model = DDP(deepcopy(model).to(device=device, dtype=torch.float32), device_ids=[i], output_device=i)
     baseline_optimizer = torch.optim.AdamW(baseline_model.parameters(), lr=lr, weight_decay=0.0)
 
-    if config_dict["zero_optimization"]["stage"] == 3:
+    use_amp = dtype != torch.float32
+    scaler = GradScaler() if use_amp else None
+
+    stage_3_enabled = config_dict["zero_optimization"]["stage"] == 3
+    if stage_3_enabled:
         with deepspeed.zero.Init(config_dict_or_path=config_dict):
             target_model = model_cls(hidden_dim)
         with GatheredParameters(target_model.parameters(), modifier_rank=0):
@@ -173,32 +237,11 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
 
     train_batch_size = config_dict["train_micro_batch_size_per_gpu"]
 
-    xs = [torch.randn(train_batch_size, hidden_dim, device=device, dtype=dtype) for _ in range(iteration)]
+    xs = [torch.randn(train_batch_size, hidden_dim, device=device, dtype=torch.float32) for _ in range(iteration)]
     ys = [torch.randn_like(x) for x in xs]
 
     for i, (x, y) in enumerate(zip(xs, ys)):
-        baseline_loss = baseline_model(x, y)
-        target_loss = target_engine(x, y)
-
-        assert torch.allclose(baseline_loss, target_loss, rtol=rtol, atol=atol)
-
-        with GatheredParameters(target_engine.parameters()):
-            for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
-                assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
-
-        baseline_loss.backward()
-        target_engine.backward(target_loss)
-
-        for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
-            g2 = deepspeed.utils.safe_get_full_grad(p2)
-            assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
-            assert torch.allclose(p1.grad, g2, rtol=rtol, atol=atol)
-
-        baseline_optimizer.step()
-        target_engine.step()
-
-        baseline_model.zero_grad()
-
-        with GatheredParameters(target_engine.parameters()):
-            for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
-                assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
+        if dtype == torch.float32:
+            train_no_amp(baseline_model, baseline_optimizer, target_engine, x, y, rtol, atol)
+        else:
+            train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, x, y, rtol, atol)

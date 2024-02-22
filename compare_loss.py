@@ -15,14 +15,14 @@ from common import bf16_required_version_check, compare_loss
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description='DeepSpeed ZeRO unit test.')
-    parser.add_argument('--local_rank', type=int, default=-1, help='local rank')
-    parser.add_argument('--dtype', choices=['torch.bfloat16', 'torch.float16', 'torch.float32'], default='torch.float32', help='data type')
+    parser = argparse.ArgumentParser(description='DeepSpeed ZeRO correctness test.')
+    parser.add_argument('--local_rank', type=int, default=-1, help='Local rank')
+    parser.add_argument('--dtype', choices=['torch.bfloat16', 'torch.float16', 'torch.float32'], default='torch.float32', help='Data type')
     parser.add_argument('--zero_stage', type=int, choices=[0, 1, 2, 3], default=1, help='ZeRO stage')
-    parser.add_argument('--offload_device', choices=['none', 'cpu', 'nvme'], default='none', help='offload device')
-    parser.add_argument('--use_torch_adam', action='store_true', help='use torch adam optimizer')
-    parser.add_argument('--rtol', type=float, default=0., help='relative tolerance')
-    parser.add_argument('--atol', type=float, default=0., help='absolute tolerance')
+    parser.add_argument('--offload_device', choices=['none', 'cpu', 'nvme'], default='none', help='Offload device')
+    parser.add_argument('--use_torch_adam', action='store_true', help='Use torch adam optimizer')
+    parser.add_argument('--rtol', type=float, default=0., help='Relative tolerance')
+    parser.add_argument('--atol', type=float, default=0., help='Absolute tolerance')
     
     return parser.parse_args()
 

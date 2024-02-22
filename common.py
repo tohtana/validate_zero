@@ -49,6 +49,10 @@ class EnableDeterminism:
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
         torch.use_deterministic_algorithms(True)
 
+        # Enable CUDNN deterministic mode
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     def __exit__(self, type, value, traceback):
         random.setstate(self.saved_random_state)
         np.random.set_state(self.saved_np_random_state)
@@ -119,7 +123,7 @@ def train_amp(baseline_model,
 
     with GatheredParameters(target_engine.parameters()):
         for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
-            assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
+            assert torch.allclose(p1.half(), p2, rtol=rtol, atol=atol)
 
 
 def train_no_amp(baseline_model,
@@ -241,7 +245,7 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     ys = [torch.randn_like(x) for x in xs]
 
     for i, (x, y) in enumerate(zip(xs, ys)):
-        if dtype == torch.float32:
-            train_no_amp(baseline_model, baseline_optimizer, target_engine, x, y, rtol, atol)
-        else:
+        if use_amp:
             train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, x, y, rtol, atol)
+        else:
+            train_no_amp(baseline_model, baseline_optimizer, target_engine, x, y, rtol, atol)

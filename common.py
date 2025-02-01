@@ -20,60 +20,6 @@ from deepspeed.git_version_info import torch_info
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 
 
-class EnableDeterminism:
-
-    def __init__(self, seed: int):
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
-
-        self.seed = seed + local_rank
-        self.saved_random_state = None
-        self.saved_np_random_state = None
-        self.saved_cuda_launch_blocking = None
-        self.saved_cublas_workspace_config = None
-        self.saved_deterministic_algorithms = None
-
-    def __enter__(self):
-        self.saved_random_state = random.getstate()
-        self.saved_np_random_state = np.random.get_state()
-        self.saved_acc_rng_state = get_accelerator().get_rng_state()
-        self.saved_cuda_launch_blocking = os.environ.get("CUDA_LAUNCH_BLOCKING", "")
-        self.saved_cublas_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG", "")
-        self.saved_deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
-
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-        get_accelerator().manual_seed(self.seed)
-        get_accelerator().manual_seed_all(self.seed)
-
-        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-        torch.use_deterministic_algorithms(True)
-
-        # Enable CUDNN deterministic mode
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    def __exit__(self, type, value, traceback):
-        random.setstate(self.saved_random_state)
-        np.random.set_state(self.saved_np_random_state)
-        get_accelerator().set_rng_state(self.saved_acc_rng_state)
-        os.environ["CUDA_LAUNCH_BLOCKING"] = self.saved_cuda_launch_blocking
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = self.saved_cublas_workspace_config
-        torch.use_deterministic_algorithms(self.saved_deterministic_algorithms)
-
-
-def enable_determinism(seed: int):
-
-    def decorator(func: Callable) -> Callable:
-
-        def wrapper(*args: Any, **kwargs: Any):
-            with EnableDeterminism(seed):
-                return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
 
 def bf16_required_version_check(accelerator_check=True):
     split_version = lambda x: map(int, x.split('.')[:2])
@@ -106,24 +52,30 @@ def train_amp(baseline_model,
                 dtype,
                 scaler,
                 x, y,
-                rtol, atol):
+                rtol, atol,
+                ds_autocast):
     # Runs the forward pass with autocasting.
     with torch.autocast(device_type="cuda", dtype=dtype):
         baseline_optimizer.zero_grad()
         baseline_loss = baseline_model(x, y)
-        scaler.scale(baseline_loss).backward()
-        scaler.step(baseline_optimizer)
-        scaler.update()
 
-    target_loss = target_engine(x.to(dtype), y.to(dtype))
-    assert torch.allclose(baseline_loss.half(), target_loss, rtol=rtol, atol=atol)
+    scaler.scale(baseline_loss).backward()
+    scaler.step(baseline_optimizer)
+    scaler.update()
+
+    if not ds_autocast:
+        x = x.to(dtype)
+        y = y.to(dtype)
+    target_loss = target_engine(x, y)
+
+    assert torch.allclose(baseline_loss.float(), target_loss.float(), rtol=rtol, atol=atol)
 
     target_engine.backward(target_loss)
     target_engine.step()
 
     with GatheredParameters(target_engine.parameters()):
         for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
-            assert torch.allclose(p1.half(), p2, rtol=rtol, atol=atol)
+            assert torch.allclose(p1.float(), p2.float(), rtol=rtol, atol=atol)
 
 
 def train_no_amp(baseline_model,
@@ -159,7 +111,6 @@ def train_no_amp(baseline_model,
             assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
 
 
-@enable_determinism(123)
 def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     iteration = 5
     hidden_dim = 10
@@ -200,10 +151,13 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
             "nvme_path": str(tmpdir)
         }
 
-    if dtype == torch.float16:
-        config_dict["fp16"] = {"enabled": True, "initial_scale_power": 8}
-    elif dtype == torch.bfloat16:
-        config_dict["bf16"] = {"enabled": True}
+    if args.ds_autocast:
+        config_dict["torch_autocast"] = {"enabled": True, "dtype": str(dtype)}
+    else:
+        if dtype == torch.float16:
+            config_dict["fp16"] = {"enabled": True, "initial_scale_power": 8}
+        elif dtype == torch.bfloat16:
+            config_dict["bf16"] = {"enabled": True}
 
     device = torch.device(get_accelerator().current_device_name())
     model = model_cls(hidden_dim)
@@ -246,6 +200,6 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
 
     for i, (x, y) in enumerate(zip(xs, ys)):
         if use_amp:
-            train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, x, y, rtol, atol)
+            train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, x, y, rtol, atol, args.ds_autocast)
         else:
             train_no_amp(baseline_model, baseline_optimizer, target_engine, x, y, rtol, atol)

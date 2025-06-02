@@ -59,33 +59,6 @@ def main(args):
         if zero_stage != 3:
             pytest.skip(f"Nvme offload not supported for zero stage {zero_stage}")
 
-    config_dict = {
-        "train_micro_batch_size_per_gpu": 1,
-        "steps_per_print": 1,
-        "optimizer": {
-            "type": "Adam",
-            "params": {
-                "lr": 0.015
-            },
-        },
-        "zero_optimization": {
-            "stage": zero_stage,
-        },
-    }
-
-    if offload_device == OffloadDeviceEnum.cpu:
-        config_dict["zero_optimization"]["offload_optimizer"] = {"device": offload_device}
-    elif offload_device == OffloadDeviceEnum.nvme:
-        tmpdir = os.getcwd()
-        config_dict["zero_optimization"]["offload_optimizer"] = {
-            "device": offload_device,
-            "nvme_path": str(tmpdir)
-        }
-    if dtype == torch.float16:
-        config_dict["fp16"] = {"enabled": True, "initial_scale_power": 8}
-    elif dtype == torch.bfloat16:
-        config_dict["bf16"] = {"enabled": True}
-
     compare_loss(args, SimpleModel, rtol=args.rtol, atol=args.atol)
 
 

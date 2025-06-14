@@ -86,54 +86,133 @@ def train_amp(baseline_model,
                 target_engine,
                 dtype,
                 scaler,
-                x, y,
+                x_batch, y_batch,
+                gradient_accumulation_steps,
                 rtol, atol):
-    # Runs the forward pass with autocasting.
-    with torch.autocast(device_type="cuda", dtype=dtype):
-        baseline_optimizer.zero_grad()
-        baseline_loss = baseline_model(x, y)
-        scaler.scale(baseline_loss).backward()
-        scaler.step(baseline_optimizer)
-        scaler.update()
-
-    target_loss = target_engine(x.to(dtype), y.to(dtype))
-    assert torch.allclose(baseline_loss.half(), target_loss, rtol=rtol, atol=atol)
-
-    target_engine.backward(target_loss)
+    # Runs the forward pass with autocasting and gradient accumulation.
+    baseline_loss_total = 0.0
+    target_loss_total = 0.0
+    
+    baseline_optimizer.zero_grad()
+    
+    for step in range(gradient_accumulation_steps):
+        x = x_batch[step]
+        y = y_batch[step]
+        
+        # Disable gradient synchronization for all but the last micro-batch
+        is_last_step = (step == gradient_accumulation_steps - 1)
+        
+        if is_last_step:
+            # Normal forward/backward with gradient synchronization
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                baseline_loss_raw = baseline_model(x, y)
+                baseline_loss_scaled = baseline_loss_raw / gradient_accumulation_steps
+                baseline_loss_total += baseline_loss_raw.item()  # Accumulate raw loss for comparison
+                scaler.scale(baseline_loss_scaled).backward()  # Backward on scaled loss for correct gradients
+        else:
+            # Forward/backward without gradient synchronization
+            with baseline_model.no_sync():
+                with torch.autocast(device_type="cuda", dtype=dtype):
+                    baseline_loss_raw = baseline_model(x, y)
+                    baseline_loss_scaled = baseline_loss_raw / gradient_accumulation_steps
+                    baseline_loss_total += baseline_loss_raw.item()  # Accumulate raw loss for comparison
+                    scaler.scale(baseline_loss_scaled).backward()  # Backward on scaled loss for correct gradients
+        
+        target_loss = target_engine(x.to(dtype), y.to(dtype))
+        target_loss_total += target_loss.item()
+        target_engine.backward(target_loss)
+    
+    scaler.step(baseline_optimizer)
+    scaler.update()
     target_engine.step()
 
+    # Compare accumulated losses
+    # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
+    assert torch.allclose(torch.tensor(baseline_loss_total).half(), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
+
     with GatheredParameters(target_engine.parameters()):
-        for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
-            assert torch.allclose(p1.half(), p2, rtol=rtol, atol=atol)
+        for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
+            p1_half = p1.half()
+            if not torch.allclose(p1_half, p2, rtol=rtol, atol=atol):
+                max_diff = torch.max(torch.abs(p1_half - p2)).item()
+                mean_diff = torch.mean(torch.abs(p1_half - p2)).item()
+                print(f"Parameter {i} mismatch (AMP):")
+                print(f"  Max absolute difference: {max_diff}")
+                print(f"  Mean absolute difference: {mean_diff}")
+                print(f"  Tolerance settings: rtol={rtol}, atol={atol}")
+                print(f"  Parameter shapes: baseline={p1_half.shape}, target={p2.shape}")
+                print(f"  Baseline param stats: min={p1_half.min().item():.6f}, max={p1_half.max().item():.6f}, mean={p1_half.mean().item():.6f}")
+                print(f"  Target param stats: min={p2.min().item():.6f}, max={p2.max().item():.6f}, mean={p2.mean().item():.6f}")
+            assert torch.allclose(p1_half, p2, rtol=rtol, atol=atol), f"Parameter {i} comparison failed (AMP)"
 
 
 def train_no_amp(baseline_model,
                  baseline_optimizer,
                  target_engine,
-                 x, y,
+                 x_batch, y_batch,
+                 gradient_accumulation_steps,
                  rtol, atol):
 
-    baseline_loss = baseline_model(x, y)
-    target_loss = target_engine(x, y)
-
-    assert torch.allclose(baseline_loss, target_loss, rtol=rtol, atol=atol)
-
-    baseline_loss.backward()
-    target_engine.backward(target_loss)
+    baseline_loss_total = 0.0
+    target_loss_total = 0.0
+    
+    baseline_optimizer.zero_grad()
+    
+    for step in range(gradient_accumulation_steps):
+        x = x_batch[step]
+        y = y_batch[step]
+        
+        # Disable gradient synchronization for all but the last micro-batch
+        is_last_step = (step == gradient_accumulation_steps - 1)
+        
+        if is_last_step:
+            # Normal forward/backward with gradient synchronization
+            baseline_loss_raw = baseline_model(x, y)
+            baseline_loss_scaled = baseline_loss_raw / gradient_accumulation_steps
+            baseline_loss_total += baseline_loss_raw.item()  # Accumulate raw loss for comparison
+            baseline_loss_scaled.backward()  # Backward on scaled loss for correct gradients
+        else:
+            # Forward/backward without gradient synchronization
+            with baseline_model.no_sync():
+                baseline_loss_raw = baseline_model(x, y)
+                baseline_loss_scaled = baseline_loss_raw / gradient_accumulation_steps
+                baseline_loss_total += baseline_loss_raw.item()  # Accumulate raw loss for comparison
+                baseline_loss_scaled.backward()  # Backward on scaled loss for correct gradients
+        
+        target_loss = target_engine(x, y)
+        target_loss_total += target_loss.item()
+        # DeepSpeed handles the scaling internally, so we don't need to scale the loss here
+        target_engine.backward(target_loss)
+        # The gradient accumulation boundary is also handled by DeepSpeed
+        target_engine.step()
 
     baseline_optimizer.step()
-    target_engine.step()
 
-    baseline_model.zero_grad()
+    # Compare accumulated losses
+    # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
+    print(f"Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
+    assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
 
     with GatheredParameters(target_engine.parameters()):
-        for p1, p2 in zip(baseline_model.parameters(), target_engine.parameters()):
-            assert torch.allclose(p1, p2, rtol=rtol, atol=atol)
+        for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
+            if not torch.allclose(p1, p2, rtol=rtol, atol=atol):
+                max_diff = torch.max(torch.abs(p1 - p2)).item()
+                mean_diff = torch.mean(torch.abs(p1 - p2)).item()
+                print(f"Parameter {i} mismatch:")
+                print(f" p1 {p1} p2 {p2}")
+                print(f"  Max absolute difference: {max_diff}")
+                print(f"  Mean absolute difference: {mean_diff}")
+                print(f"  Tolerance settings: rtol={rtol}, atol={atol}")
+                print(f"  Parameter shapes: baseline={p1.shape}, target={p2.shape}")
+                print(f"  Baseline param stats: min={p1.min().item():.6f}, max={p1.max().item():.6f}, mean={p1.mean().item():.6f}")
+                print(f"  Target param stats: min={p2.min().item():.6f}, max={p2.max().item():.6f}, mean={p2.mean().item():.6f}")
+            assert torch.allclose(p1, p2, rtol=rtol, atol=atol), f"Parameter {i} comparison failed"
 
 
 def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
-    iteration = 5
+    iteration = args.iterations
     hidden_dim = 4
+    gradient_accumulation_steps = args.gradient_accumulation_steps
 
     dtype = eval(args.dtype)
     zero_stage = args.zero_stage
@@ -154,9 +233,13 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     # Initialize distributed BEFORE setting deterministic seeds
     deepspeed.init_distributed(dist_backend='nccl')
     
+    print(f"Running correctness test with gradient_accumulation_steps={gradient_accumulation_steps}")
+    print(f"Running {iteration} iterations with {gradient_accumulation_steps * iteration} total micro steps")
+    
     # Now apply deterministic settings
     config_dict = {
         "train_micro_batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
         "steps_per_print": 1,
         "optimizer": {
             "type": "Adam",
@@ -227,11 +310,20 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
 
     train_batch_size = config_dict["train_micro_batch_size_per_gpu"]
 
-    xs = [torch.randn(train_batch_size, hidden_dim, device=device, dtype=torch.float32) for _ in range(iteration)]
-    ys = [torch.randn_like(x) for x in xs]
+    # Generate data for each iteration and gradient accumulation step
+    xs = []
+    ys = []
+    for i in range(iteration):
+        x_batch = [torch.randn(train_batch_size, hidden_dim, device=device, dtype=torch.float32) 
+                   for _ in range(gradient_accumulation_steps)]
+        y_batch = [torch.randn_like(x) for x in x_batch]
+        xs.append(x_batch)
+        ys.append(y_batch)
 
-    for i, (x, y) in enumerate(zip(xs, ys)):
+    for i, (x_batch, y_batch) in enumerate(zip(xs, ys)):
         if use_amp:
-            train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, x, y, rtol, atol)
+            train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, 
+                     x_batch, y_batch, gradient_accumulation_steps, rtol, atol)
         else:
-            train_no_amp(baseline_model, baseline_optimizer, target_engine, x, y, rtol, atol)
+            train_no_amp(baseline_model, baseline_optimizer, target_engine, 
+                        x_batch, y_batch, gradient_accumulation_steps, rtol, atol)

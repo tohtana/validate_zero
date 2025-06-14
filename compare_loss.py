@@ -29,6 +29,8 @@ def get_args():
     parser.add_argument('--compile', action='store_true', help='Enable torch.compile() on the model')
     parser.add_argument('--deepcompile', action='store_true', help='Enable deepcompile optimization')
     parser.add_argument('--verbose_logging', action='store_true', help='Enable verbose debugging for recompilations')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of gradient accumulation steps')
+    parser.add_argument('--iterations', type=int, default=5, help='Number of parameter update iterations')
     
     return parser.parse_args()
 

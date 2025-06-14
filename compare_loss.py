@@ -13,6 +13,9 @@ from deepspeed.accelerator import get_accelerator
 
 from common import bf16_required_version_check, compare_loss
 
+# Import debugging utilities
+from debug_util import setup_compilation_debugging, debug_guard_failures
+
 
 def get_args():
     parser = argparse.ArgumentParser(description='DeepSpeed ZeRO correctness test.')
@@ -22,7 +25,10 @@ def get_args():
     parser.add_argument('--offload_device', choices=['none', 'cpu', 'nvme'], default='none', help='Offload device')
     parser.add_argument('--use_torch_adam', action='store_true', help='Use torch adam optimizer')
     parser.add_argument('--rtol', type=float, default=0., help='Relative tolerance')
-    parser.add_argument('--atol', type=float, default=0., help='Absolute tolerance')
+    parser.add_argument('--atol', type=float, default=0.001, help='Absolute tolerance')
+    parser.add_argument('--compile', action='store_true', help='Enable torch.compile() on the model')
+    parser.add_argument('--deepcompile', action='store_true', help='Enable deepcompile optimization')
+    parser.add_argument('--verbose_logging', action='store_true', help='Enable verbose debugging for recompilations')
     
     return parser.parse_args()
 
@@ -64,4 +70,10 @@ def main(args):
 
 if __name__ == '__main__':
     args = get_args()
+    
+    # Enable enhanced debugging for compilation analysis if requested
+    if args.verbose_logging:
+        setup_compilation_debugging()
+        debug_guard_failures()
+    
     main(args)

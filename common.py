@@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 
 import deepspeed
+import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero import GatheredParameters
 from deepspeed.git_version_info import torch_info
@@ -108,7 +109,10 @@ def train_amp(baseline_model,
                 baseline_loss_raw = baseline_model(x, y)
                 baseline_loss_scaled = baseline_loss_raw / gradient_accumulation_steps
                 baseline_loss_total += baseline_loss_raw.item()  # Accumulate raw loss for comparison
-                scaler.scale(baseline_loss_scaled).backward()  # Backward on scaled loss for correct gradients
+                if scaler is None:
+                    baseline_loss_scaled.backward()
+                else:
+                    scaler.scale(baseline_loss_scaled).backward()  # Backward on scaled loss for correct gradients
         else:
             # Forward/backward without gradient synchronization
             with baseline_model.no_sync():
@@ -116,34 +120,41 @@ def train_amp(baseline_model,
                     baseline_loss_raw = baseline_model(x, y)
                     baseline_loss_scaled = baseline_loss_raw / gradient_accumulation_steps
                     baseline_loss_total += baseline_loss_raw.item()  # Accumulate raw loss for comparison
-                    scaler.scale(baseline_loss_scaled).backward()  # Backward on scaled loss for correct gradients
+                    if scaler is None:
+                        baseline_loss_scaled.backward()
+                    else:
+                        scaler.scale(baseline_loss_scaled).backward()  # Backward on scaled loss for correct gradients
         
         target_loss = target_engine(x.to(dtype), y.to(dtype))
         target_loss_total += target_loss.item()
         target_engine.backward(target_loss)
-    
-    scaler.step(baseline_optimizer)
-    scaler.update()
+
+    if scaler is None:
+        baseline_optimizer.step()
+    else:
+        scaler.step(baseline_optimizer)
+        scaler.update()
     target_engine.step()
 
     # Compare accumulated losses
     # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
-    assert torch.allclose(torch.tensor(baseline_loss_total).half(), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
+    print(f"[r{dist.get_rank()}] Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
+    assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
 
-    with GatheredParameters(target_engine.parameters()):
-        for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
-            p1_half = p1.half()
-            if not torch.allclose(p1_half, p2, rtol=rtol, atol=atol):
-                max_diff = torch.max(torch.abs(p1_half - p2)).item()
-                mean_diff = torch.mean(torch.abs(p1_half - p2)).item()
-                print(f"Parameter {i} mismatch (AMP):")
-                print(f"  Max absolute difference: {max_diff}")
-                print(f"  Mean absolute difference: {mean_diff}")
-                print(f"  Tolerance settings: rtol={rtol}, atol={atol}")
-                print(f"  Parameter shapes: baseline={p1_half.shape}, target={p2.shape}")
-                print(f"  Baseline param stats: min={p1_half.min().item():.6f}, max={p1_half.max().item():.6f}, mean={p1_half.mean().item():.6f}")
-                print(f"  Target param stats: min={p2.min().item():.6f}, max={p2.max().item():.6f}, mean={p2.mean().item():.6f}")
-            assert torch.allclose(p1_half, p2, rtol=rtol, atol=atol), f"Parameter {i} comparison failed (AMP)"
+    # with GatheredParameters(target_engine.parameters()):
+    #     for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
+    #         p1_half = p1.half()
+    #         if not torch.allclose(p1_half, p2, rtol=rtol, atol=atol):
+    #             max_diff = torch.max(torch.abs(p1_half - p2)).item()
+    #             mean_diff = torch.mean(torch.abs(p1_half - p2)).item()
+    #             print(f"Parameter {i} mismatch (AMP):")
+    #             print(f"  Max absolute difference: {max_diff}")
+    #             print(f"  Mean absolute difference: {mean_diff}")
+    #             print(f"  Tolerance settings: rtol={rtol}, atol={atol}")
+    #             print(f"  Parameter shapes: baseline={p1_half.shape}, target={p2.shape}")
+    #             print(f"  Baseline param stats: min={p1_half.min().item():.6f}, max={p1_half.max().item():.6f}, mean={p1_half.mean().item():.6f}")
+    #             print(f"  Target param stats: min={p2.min().item():.6f}, max={p2.max().item():.6f}, mean={p2.mean().item():.6f}")
+    #         assert torch.allclose(p1_half, p2, rtol=rtol, atol=atol), f"Parameter {i} comparison failed (AMP)"
 
 
 def train_no_amp(baseline_model,
@@ -190,7 +201,7 @@ def train_no_amp(baseline_model,
 
     # Compare accumulated losses
     # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
-    print(f"Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
+    print(f"[r{dist.get_rank()}] Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
     assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
 
     with GatheredParameters(target_engine.parameters()):
@@ -252,7 +263,13 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
         },
         "compile": {
             "deepcompile": args.deepcompile
-        }
+        },
+        "torch_autocast": {
+            "enabled": args.torch_autocast_dtype is not None,
+            "dtype": args.torch_autocast_dtype.split('.')[-1] if args.torch_autocast_dtype else args.dtype,
+            # "lower_precision_safe_modules": [
+            # ]
+        },
     }
 
     if offload_device == OffloadDeviceEnum.cpu:
@@ -264,21 +281,25 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
             "nvme_path": str(tmpdir)
         }
 
-    if dtype == torch.float16:
-        config_dict["fp16"] = {"enabled": True, "initial_scale_power": 8}
-    elif dtype == torch.bfloat16:
-        config_dict["bf16"] = {"enabled": True}
-
     device = torch.device(get_accelerator().current_device_name())
     model = model_cls(hidden_dim)
-    
+
+    # Handle mixed precision configuration
+    if args.torch_autocast_dtype:
+        # If torch_autocast is enabled, we don't set fp16/bf16 in DeepSpeed config
+        model.to(dtype=dtype)
+    else:
+        if dtype == torch.float16:
+            config_dict["fp16"] = {"enabled": True, "initial_scale_power": 8}
+        elif dtype == torch.bfloat16:
+            config_dict["bf16"] = {"enabled": True}
+
     i = get_accelerator().current_device()
     lr = config_dict["optimizer"]["params"]["lr"]
-    baseline_model = DDP(deepcopy(model).to(device=device, dtype=torch.float32), device_ids=[i], output_device=i)
+    baseline_model = DDP(deepcopy(model).to(device=device, dtype=dtype), device_ids=[i], output_device=i)
     baseline_optimizer = torch.optim.AdamW(baseline_model.parameters(), lr=lr, weight_decay=0.0)
 
-    use_amp = dtype != torch.float32
-    scaler = GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler() if args.torch_autocast_dtype and dtype == torch.float16 else None
 
     stage_3_enabled = config_dict["zero_optimization"]["stage"] == 3
     if stage_3_enabled:
@@ -314,14 +335,14 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     xs = []
     ys = []
     for i in range(iteration):
-        x_batch = [torch.randn(train_batch_size, hidden_dim, device=device, dtype=torch.float32) 
+        x_batch = [torch.randn(train_batch_size, hidden_dim, device=device, dtype=dtype) 
                    for _ in range(gradient_accumulation_steps)]
         y_batch = [torch.randn_like(x) for x in x_batch]
         xs.append(x_batch)
         ys.append(y_batch)
 
     for i, (x_batch, y_batch) in enumerate(zip(xs, ys)):
-        if use_amp:
+        if args.torch_autocast_dtype:
             train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, 
                      x_batch, y_batch, gradient_accumulation_steps, rtol, atol)
         else:

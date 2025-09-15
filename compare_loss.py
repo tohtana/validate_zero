@@ -32,6 +32,8 @@ def get_args():
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of gradient accumulation steps')
     parser.add_argument('--iterations', type=int, default=5, help='Number of parameter update iterations')
     parser.add_argument('--torch_autocast_dtype', choices=[None, 'torch.bfloat16', 'torch.float16'], default=None, help='Torch autocast dtype')
+    parser.add_argument('--universal_optimizer', action='store_true', help='Enable universal optimizer')
+    parser.add_argument('--skip_verify', action='store_true', help='Skip verification of the results')
     return parser.parse_args()
 
 

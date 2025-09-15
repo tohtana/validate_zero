@@ -21,6 +21,12 @@ from deepspeed.git_version_info import torch_info
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 
 
+def tensor_to_short_string(t, num_elements=10):
+    list_val = t.flatten().tolist()[:num_elements]
+    list_val_str = [f"{x:.4f}" for x in list_val]
+    return f"[{', '.join(list_val_str)}]"
+    
+
 def enable_full_determinism(seed: int):
     """Enable full determinism for reproducible results"""
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -89,6 +95,7 @@ def train_amp(baseline_model,
                 scaler,
                 x_batch, y_batch,
                 gradient_accumulation_steps,
+                skip_verify,
                 rtol, atol):
     # Runs the forward pass with autocasting and gradient accumulation.
     baseline_loss_total = 0.0
@@ -139,7 +146,8 @@ def train_amp(baseline_model,
     # Compare accumulated losses
     # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
     print(f"[r{dist.get_rank()}] Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
-    assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
+    if not skip_verify:
+        assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
 
     # with GatheredParameters(target_engine.parameters()):
     #     for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
@@ -162,6 +170,7 @@ def train_no_amp(baseline_model,
                  target_engine,
                  x_batch, y_batch,
                  gradient_accumulation_steps,
+                 skip_verify,
                  rtol, atol):
 
     baseline_loss_total = 0.0
@@ -202,7 +211,8 @@ def train_no_amp(baseline_model,
     # Compare accumulated losses
     # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
     print(f"[r{dist.get_rank()}] Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
-    assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
+    if not skip_verify:
+        assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
 
     with GatheredParameters(target_engine.parameters()):
         for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
@@ -251,7 +261,7 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     config_dict = {
         "train_micro_batch_size_per_gpu": 1,
         "gradient_accumulation_steps": gradient_accumulation_steps,
-        "steps_per_print": 1,
+        # "steps_per_print": 1,
         "optimizer": {
             "type": "Adam",
             "params": {
@@ -270,6 +280,9 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
             # "lower_precision_safe_modules": [
             # ]
         },
+        "universal_optimizer": {
+            "enabled": args.universal_optimizer
+        }
     }
 
     if offload_device == OffloadDeviceEnum.cpu:
@@ -311,7 +324,7 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     else:
         target_model = deepcopy(model)
 
-    if args.use_torch_adam:
+    if args.use_torch_adam or args.universal_optimizer:
         ds_optimizer = torch.optim.Adam(target_model.parameters(), lr=lr)
         del config_dict["optimizer"]
         target_engine, _, _, _ = deepspeed.initialize(config=config_dict,
@@ -344,7 +357,7 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     for i, (x_batch, y_batch) in enumerate(zip(xs, ys)):
         if args.torch_autocast_dtype:
             train_amp(baseline_model, baseline_optimizer, target_engine, dtype, scaler, 
-                     x_batch, y_batch, gradient_accumulation_steps, rtol, atol)
+                     x_batch, y_batch, gradient_accumulation_steps, args.skip_verify, rtol, atol)
         else:
             train_no_amp(baseline_model, baseline_optimizer, target_engine, 
-                        x_batch, y_batch, gradient_accumulation_steps, rtol, atol)
+                        x_batch, y_batch, gradient_accumulation_steps, args.skip_verify, rtol, atol)

@@ -30,6 +30,7 @@ def get_args():
     parser.add_argument('--deepcompile', action='store_true', help='Enable deepcompile optimization')
     parser.add_argument('--verbose_logging', action='store_true', help='Enable verbose debugging for recompilations')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of gradient accumulation steps')
+    parser.add_argument('--num_layers', type=int, default=1, help='Number of linear layers in the model')
     parser.add_argument('--iterations', type=int, default=5, help='Number of parameter update iterations')
     parser.add_argument('--torch_autocast_dtype', choices=[None, 'torch.bfloat16', 'torch.float16'], default=None, help='Torch autocast dtype')
     parser.add_argument('--universal_optimizer', action='store_true', help='Enable universal optimizer')

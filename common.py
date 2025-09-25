@@ -295,7 +295,7 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
         }
 
     device = torch.device(get_accelerator().current_device_name())
-    model = model_cls(hidden_dim)
+    model = model_cls(hidden_dim, nlayers=args.num_layers)
 
     # Handle mixed precision configuration
     if args.torch_autocast_dtype:
@@ -317,7 +317,7 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     stage_3_enabled = config_dict["zero_optimization"]["stage"] == 3
     if stage_3_enabled:
         with deepspeed.zero.Init(config_dict_or_path=config_dict):
-            target_model = model_cls(hidden_dim)
+            target_model = model_cls(hidden_dim, nlayers=args.num_layers)
         with GatheredParameters(target_model.parameters(), modifier_rank=0):
             for p1, p2 in zip(target_model.parameters(), model.parameters()):
                 p1.data.copy_(p2.data)

@@ -258,6 +258,8 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     print(f"Running {iteration} iterations with {gradient_accumulation_steps * iteration} total micro steps")
     
     # Now apply deterministic settings
+    optimizer_dtype_arg = getattr(args, "optimizer_dtype", None)
+
     config_dict = {
         "train_micro_batch_size_per_gpu": 1,
         "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -284,6 +286,9 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
             "enabled": args.universal_optimizer
         }
     }
+
+    if optimizer_dtype_arg is not None:
+        config_dict["universal_optimizer"]["optimizer_dtype"] = optimizer_dtype_arg
 
     if offload_device == OffloadDeviceEnum.cpu:
         config_dict["zero_optimization"]["offload_optimizer"] = {"device": offload_device}

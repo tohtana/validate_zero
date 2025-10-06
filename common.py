@@ -6,11 +6,12 @@
 import random
 import os
 import numpy as np
-from typing import Callable, Any
+from typing import Callable, Any, Optional
 from copy import deepcopy
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.testing import assert_close as torch_assert_close
 from torch.cuda.amp import autocast, GradScaler
 
 import deepspeed
@@ -19,6 +20,50 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero import GatheredParameters
 from deepspeed.git_version_info import torch_info
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+
+
+def _ensure_tensor(value: Any, device: torch.device) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    return torch.tensor(value, device=device)
+
+
+def reduce_boolean_flags(flag: bool, op=all) -> bool:
+    if not dist.is_initialized():
+        return flag
+    device = get_accelerator().current_device()
+    tensor_flag = torch.tensor(1 if flag else 0, dtype=torch.int, device=device)
+    world_size = dist.get_world_size()
+    tensor_flag_buf = torch.zeros(world_size, dtype=torch.int, device=device)
+    dist.all_gather_into_tensor(tensor_flag_buf, tensor_flag)
+    list_flags = [bool(f) for f in tensor_flag_buf.tolist()]
+    return op(list_flags)
+
+
+def allclose_on_all_ranks(actual, expected, assert_message=None, **kwargs) -> None:
+    """
+    Compare two tensors across all ranks to ensure either all succeed or all fail together.
+    """
+    device = get_accelerator().current_device()
+    actual_tensor = _ensure_tensor(actual, device)
+    expected_tensor = _ensure_tensor(expected, device)
+
+    allclose_local = False
+    mismatch_msg = ""
+    caught_error: Optional[AssertionError] = None
+    try:
+        torch_assert_close(actual_tensor, expected_tensor, **kwargs)
+        allclose_local = True
+    except AssertionError as exc:
+        mismatch_msg = f"Tensors are not close: actual={actual_tensor}, expected={expected_tensor}, kwargs={kwargs}"
+        caught_error = exc
+
+    allclose_global = reduce_boolean_flags(allclose_local, all)
+    if not allclose_global:
+        message = "Tensors are not close on all ranks." if assert_message is None else assert_message
+        if caught_error is not None:
+            mismatch_msg = f"{mismatch_msg} (original error: {caught_error})"
+        raise AssertionError(f"{message} {mismatch_msg}")
 
 
 def tensor_to_short_string(t, num_elements=10):
@@ -147,7 +192,11 @@ def train_amp(baseline_model,
     # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
     print(f"[r{dist.get_rank()}] Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
     if not skip_verify:
-        assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
+        allclose_on_all_ranks(baseline_loss_total,
+                              target_loss_total,
+                              assert_message="Loss mismatch during AMP training",
+                              rtol=rtol,
+                              atol=atol)
 
     # with GatheredParameters(target_engine.parameters()):
     #     for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
@@ -212,11 +261,16 @@ def train_no_amp(baseline_model,
     # Both baseline_loss_total and target_loss_total now contain raw (unscaled) losses
     print(f"[r{dist.get_rank()}] Baseline loss: {baseline_loss_total}, Target loss: {target_loss_total} atol={atol}, rtol={rtol}")
     if not skip_verify:
-        assert torch.allclose(torch.tensor(baseline_loss_total), torch.tensor(target_loss_total), rtol=rtol, atol=atol)
+        allclose_on_all_ranks(baseline_loss_total,
+                              target_loss_total,
+                              assert_message="Loss mismatch during non-AMP training",
+                              rtol=rtol,
+                              atol=atol)
 
     with GatheredParameters(target_engine.parameters()):
         for i, (p1, p2) in enumerate(zip(baseline_model.parameters(), target_engine.parameters())):
-            if not torch.allclose(p1, p2, rtol=rtol, atol=atol):
+            local_match = torch.allclose(p1, p2, rtol=rtol, atol=atol)
+            if not local_match and dist.get_rank() == 0:
                 max_diff = torch.max(torch.abs(p1 - p2)).item()
                 mean_diff = torch.mean(torch.abs(p1 - p2)).item()
                 print(f"Parameter {i} mismatch:")
@@ -227,7 +281,11 @@ def train_no_amp(baseline_model,
                 print(f"  Parameter shapes: baseline={p1.shape}, target={p2.shape}")
                 print(f"  Baseline param stats: min={p1.min().item():.6f}, max={p1.max().item():.6f}, mean={p1.mean().item():.6f}")
                 print(f"  Target param stats: min={p2.min().item():.6f}, max={p2.max().item():.6f}, mean={p2.mean().item():.6f}")
-            assert torch.allclose(p1, p2, rtol=rtol, atol=atol), f"Parameter {i} comparison failed"
+            allclose_on_all_ranks(p1,
+                                  p2,
+                                  assert_message=f"Parameter {i} mismatch",
+                                  rtol=rtol,
+                                  atol=atol)
 
 
 def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
@@ -259,6 +317,7 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
     
     # Now apply deterministic settings
     optimizer_dtype_arg = getattr(args, "optimizer_dtype", None)
+    grad_accum_dtype_arg = getattr(args, "grad_accum_dtype", None)
 
     config_dict = {
         "train_micro_batch_size_per_gpu": 1,
@@ -289,6 +348,8 @@ def compare_loss(args, model_cls, rtol=1e-2, atol=1e-2):
 
     if optimizer_dtype_arg is not None:
         config_dict["universal_optimizer"]["optimizer_dtype"] = optimizer_dtype_arg
+    if grad_accum_dtype_arg is not None:
+        config_dict["universal_optimizer"]["grad_accum_dtype"] = grad_accum_dtype_arg
 
     if offload_device == OffloadDeviceEnum.cpu:
         config_dict["zero_optimization"]["offload_optimizer"] = {"device": offload_device}
